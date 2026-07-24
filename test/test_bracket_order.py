@@ -1,3 +1,7 @@
+import os
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import pytest
 from services.bracket_order_service import calculate_exit_prices
 from restx_api.schemas import BracketOrderSchema
