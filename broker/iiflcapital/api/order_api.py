@@ -1,6 +1,14 @@
+import re
+import time
 from types import SimpleNamespace
 from typing import Any
 
+from broker.iiflcapital.api.rate_limiter import (
+    MAX_RETRIES,
+    apply_rate_limit,
+    is_rate_limited,
+    retry_delay_from_headers,
+)
 from broker.iiflcapital.baseurl import BASE_URL
 from broker.iiflcapital.mapping.transform_data import (
     map_exchange,
@@ -16,6 +24,19 @@ logger = get_logger(__name__)
 
 _DIRECT_ORDER_KEYS = {"instrumentId", "exchange", "transactionType", "quantity"}
 _SUCCESS_STATUSES = {"success", "ok"}
+_ORDER_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _safe_order_id(orderid: Any) -> str:
+    """Validate orderid for inclusion in a URL path.
+
+    Rejects values containing '/', '?', '..', whitespace, etc. that could
+    pivot the request to a different endpoint.
+    """
+    candidate = str(orderid or "").strip()
+    if not candidate or not _ORDER_ID_PATTERN.match(candidate):
+        raise ValueError(f"Invalid orderid: {candidate!r}")
+    return candidate
 
 _OPEN_STATUSES = {
     "OPEN",
@@ -51,9 +72,30 @@ def _headers(auth: str) -> dict:
     }
 
 
-def _request(endpoint: str, auth: str, method: str = "GET", payload=None, params=None):
+def _request(
+    endpoint: str,
+    auth: str,
+    method: str = "GET",
+    payload=None,
+    params=None,
+    _retry_count: int = 0,
+):
+    """
+    Issue an HTTP request to an IIFL Capital order/account endpoint through
+    the shared connection pool.
+
+    This is the single choke point every order_api.py HTTP call goes through
+    (place/modify/cancel order, order book, trade book, positions, holdings).
+    It keeps its own request plumbing separate from data.py's _post, but both
+    route through the same process-wide pacer (broker.iiflcapital.api.rate_limiter)
+    so order and data calls share one clock. On a rate-limit rejection (HTTP
+    429, detected primarily; a generic retry-hint message as fallback) this
+    retries with backoff before returning control to the caller.
+    """
     client = get_httpx_client()
     url = f"{BASE_URL}{endpoint}"
+
+    apply_rate_limit()
 
     if method == "GET":
         response = client.get(url, headers=_headers(auth), params=params)
@@ -70,6 +112,16 @@ def _request(endpoint: str, auth: str, method: str = "GET", payload=None, params
         data = response.json()
     except Exception:
         data = {"status": "error", "message": response.text}
+
+    message = data.get("message") if isinstance(data, dict) else None
+    if is_rate_limited(response.status_code, message) and _retry_count < MAX_RETRIES:
+        delay = retry_delay_from_headers(response.headers, _retry_count)
+        logger.warning(
+            f"IIFL Capital order API rate limited on {endpoint}. Retrying in "
+            f"{delay:.2f}s (attempt {_retry_count + 1}/{MAX_RETRIES})"
+        )
+        time.sleep(delay)
+        return _request(endpoint, auth, method, payload, params, _retry_count + 1)
 
     return response, data
 
@@ -250,8 +302,9 @@ def place_order_api(data, auth):
     payload = order_payload if isinstance(order_payload, list) else [order_payload]
     logger.debug(f"IIFL Capital place order payload: {payload}")
     response, response_data = _request("/orders", auth, method="POST", payload=payload)
-    logger.info(f"IIFL Capital place order response status: {response.status_code}")
-    logger.info(f"IIFL Capital place order raw response: {response_data}")
+    logger.debug(f"IIFL Capital place order response status: {response.status_code}")
+    # Raw body may include broker order IDs / account context — debug only.
+    logger.debug(f"IIFL Capital place order raw response: {response_data}")
 
     result = _first_result(response_data)
     order_id = result.get("brokerOrderId")
@@ -360,12 +413,17 @@ def close_all_positions(current_api_key, auth):
 
 
 def cancel_order(orderid, auth):
-    logger.debug(f"IIFL Capital cancel order request for {orderid}")
-    response, response_data = _request(f"/orders/{orderid}", auth, method="DELETE")
-    logger.debug(f"IIFL Capital cancel order response for {orderid}: {response_data}")
+    try:
+        safe_id = _safe_order_id(orderid)
+    except ValueError as exc:
+        return {"status": "error", "message": str(exc)}, 400
+
+    logger.debug(f"IIFL Capital cancel order request for {safe_id}")
+    response, response_data = _request(f"/orders/{safe_id}", auth, method="DELETE")
+    logger.debug(f"IIFL Capital cancel order response for {safe_id}: {response_data}")
 
     if response.status_code == 200 and _ok(response_data):
-        return {"status": "success", "orderid": str(orderid)}, 200
+        return {"status": "success", "orderid": safe_id}, 200
 
     return {
         "status": "error",
@@ -374,15 +432,19 @@ def cancel_order(orderid, auth):
 
 
 def modify_order(data, auth):
-    order_id = data.get("orderid")
+    try:
+        safe_id = _safe_order_id(data.get("orderid"))
+    except ValueError as exc:
+        return {"status": "error", "message": str(exc)}, 400
+
     payload = transform_modify_order_data(data)
 
-    logger.debug(f"IIFL Capital modify order payload for {order_id}: {payload}")
-    response, response_data = _request(f"/orders/{order_id}", auth, method="PUT", payload=payload)
-    logger.debug(f"IIFL Capital modify order response for {order_id}: {response_data}")
+    logger.debug(f"IIFL Capital modify order payload for {safe_id}: {payload}")
+    response, response_data = _request(f"/orders/{safe_id}", auth, method="PUT", payload=payload)
+    logger.debug(f"IIFL Capital modify order response for {safe_id}: {response_data}")
 
     if response.status_code == 200 and _ok(response_data):
-        return {"status": "success", "orderid": str(order_id)}, 200
+        return {"status": "success", "orderid": safe_id}, 200
 
     return {
         "status": "error",

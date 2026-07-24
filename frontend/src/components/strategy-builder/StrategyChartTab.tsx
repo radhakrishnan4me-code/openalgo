@@ -1,16 +1,19 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ColorType,
   CrosshairMode,
-  LineSeries,
   createChart,
   type IChartApi,
   type ISeriesApi,
+  LineSeries,
   type UTCTimestamp,
 } from 'lightweight-charts'
-import { strategyChartApi, type StrategyChartData, type StrategyChartPoint } from '@/api/strategy-chart'
-import type { StrategyLeg } from '@/lib/strategyMath'
-import { useThemeStore } from '@/stores/themeStore'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import {
+  type StrategyChartData,
+  type StrategyChartPoint,
+  strategyChartApi,
+} from '@/api/strategy-chart'
+import { Button } from '@/components/ui/button'
 import {
   Select,
   SelectContent,
@@ -18,7 +21,8 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import { Button } from '@/components/ui/button'
+import type { StrategyLeg } from '@/lib/strategyMath'
+import { useThemeStore } from '@/stores/themeStore'
 import { showToast } from '@/utils/toast'
 
 const CHART_HEIGHT = 480
@@ -34,7 +38,20 @@ function formatIST(unixSeconds: number): { date: string; time: string } {
   const d = new Date(unixSeconds * 1000)
   const ist = new Date(d.getTime() + 5.5 * 60 * 60 * 1000)
   const dd = ist.getUTCDate().toString().padStart(2, '0')
-  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+  const months = [
+    'Jan',
+    'Feb',
+    'Mar',
+    'Apr',
+    'May',
+    'Jun',
+    'Jul',
+    'Aug',
+    'Sep',
+    'Oct',
+    'Nov',
+    'Dec',
+  ]
   const mo = months[ist.getUTCMonth()]
   const hh24 = ist.getUTCHours()
   const hh = hh24.toString().padStart(2, '0')
@@ -68,7 +85,15 @@ export default function StrategyChartTab({
   const isAnalyzer = appMode === 'analyzer'
 
   const [isLoading, setIsLoading] = useState(false)
-  const [intervals, setIntervals] = useState<string[]>(['1m', '3m', '5m', '10m', '15m', '30m', '1h'])
+  const [intervals, setIntervals] = useState<string[]>([
+    '1m',
+    '3m',
+    '5m',
+    '10m',
+    '15m',
+    '30m',
+    '1h',
+  ])
   const [selectedInterval, setSelectedInterval] = useState('5m')
   const [selectedDays, setSelectedDays] = useState('3')
   const [chartData, setChartData] = useState<StrategyChartData | null>(null)
@@ -137,7 +162,40 @@ export default function StrategyChartTab({
   const colorsRef = useRef(colors)
   colorsRef.current = colors
 
+  const applyDataToChart = useCallback((data: StrategyChartData) => {
+    if (!data.series || data.series.length === 0) {
+      underlyingSeriesRef.current?.setData([])
+      combinedSeriesRef.current?.setData([])
+      seriesMapRef.current = new Map()
+      return
+    }
+    const sorted = [...data.series].sort((a, b) => a.time - b.time)
+    const map = new Map<number, StrategyChartPoint>()
+    for (const p of sorted) map.set(p.time, p)
+    seriesMapRef.current = map
+
+    // The underlying column is optional — when the broker doesn't support
+    // the requested interval for the index (e.g., Zerodha 1m on NIFTY),
+    // we skip it. lightweight-charts treats missing values as gaps, so
+    // we filter the points that actually carry an underlying close.
+    const underlyingPoints = sorted
+      .filter(
+        (p): p is StrategyChartPoint & { underlying: number } => typeof p.underlying === 'number'
+      )
+      .map((p) => ({ time: p.time as UTCTimestamp, value: p.underlying }))
+    underlyingSeriesRef.current?.setData(underlyingPoints)
+    combinedSeriesRef.current?.setData(
+      sorted.map((p) => ({ time: p.time as UTCTimestamp, value: p.combined_premium }))
+    )
+    chartRef.current?.timeScale().fitContent()
+  }, [])
+
   // ── Chart init ────────────────────────────────────────────────
+  // showUnderlying/showCombined are intentionally read only as the series'
+  // initial `visible` value at creation time; dedicated effects below sync them
+  // via applyOptions, so adding them here would needlessly rebuild the whole
+  // chart on every toggle.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: showUnderlying/showCombined are initial-only; toggles are synced by separate applyOptions effects
   const initChart = useCallback(() => {
     if (!chartContainerRef.current) return
 
@@ -181,7 +239,7 @@ export default function StrategyChartTab({
           const ist = new Date(d.getTime() + 5.5 * 60 * 60 * 1000)
           const hh = ist.getUTCHours().toString().padStart(2, '0')
           const mm = ist.getUTCMinutes().toString().padStart(2, '0')
-          if (parseInt(selectedDays) > 1) {
+          if (parseInt(selectedDays, 10) > 1) {
             const dd = ist.getUTCDate().toString().padStart(2, '0')
             const mo = (ist.getUTCMonth() + 1).toString().padStart(2, '0')
             return `${dd}/${mo} ${hh}:${mm}`
@@ -326,34 +384,7 @@ export default function StrategyChartTab({
     }
     window.addEventListener('resize', handleResize)
     return () => window.removeEventListener('resize', handleResize)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [colors, selectedDays, underlying])
-
-  const applyDataToChart = useCallback((data: StrategyChartData) => {
-    if (!data.series || data.series.length === 0) {
-      underlyingSeriesRef.current?.setData([])
-      combinedSeriesRef.current?.setData([])
-      seriesMapRef.current = new Map()
-      return
-    }
-    const sorted = [...data.series].sort((a, b) => a.time - b.time)
-    const map = new Map<number, StrategyChartPoint>()
-    for (const p of sorted) map.set(p.time, p)
-    seriesMapRef.current = map
-
-    // The underlying column is optional — when the broker doesn't support
-    // the requested interval for the index (e.g., Zerodha 1m on NIFTY),
-    // we skip it. lightweight-charts treats missing values as gaps, so
-    // we filter the points that actually carry an underlying close.
-    const underlyingPoints = sorted
-      .filter((p): p is StrategyChartPoint & { underlying: number } => typeof p.underlying === 'number')
-      .map((p) => ({ time: p.time as UTCTimestamp, value: p.underlying }))
-    underlyingSeriesRef.current?.setData(underlyingPoints)
-    combinedSeriesRef.current?.setData(
-      sorted.map((p) => ({ time: p.time as UTCTimestamp, value: p.combined_premium }))
-    )
-    chartRef.current?.timeScale().fitContent()
-  }, [])
+  }, [colors, selectedDays, underlying, applyDataToChart])
 
   useEffect(() => {
     const cleanup = initChart()
@@ -375,6 +406,7 @@ export default function StrategyChartTab({
   }, [showCombined])
 
   // ── Intervals ─────────────────────────────────────────────────
+  // biome-ignore lint/correctness/useExhaustiveDependencies: one-time fetch of available intervals on mount; selectedInterval is only read to pick a sensible default and must not re-trigger the fetch
   useEffect(() => {
     let cancelled = false
     ;(async () => {
@@ -401,12 +433,16 @@ export default function StrategyChartTab({
     return () => {
       cancelled = true
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   // ── Leg identity — drives auto-refetch on add/remove/toggle ───
   const identity = useMemo(() => legsIdentity(legs, optionExchange), [legs, optionExchange])
 
+  // `legs` is read inside, but we deliberately depend on the derived `identity`
+  // string (legs + optionExchange) instead of the raw `legs` array so that
+  // unrelated leg-object reference changes don't trigger extra broker history
+  // calls — only add/remove/toggle/symbol changes (which change identity) refetch.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: depend on derived `identity` (not raw `legs`) to avoid over-fetching the broker history API
   const loadData = useCallback(async () => {
     if (!underlying || !exchange) return
     const payloadLegs = legs
@@ -434,7 +470,7 @@ export default function StrategyChartTab({
         exchange,
         legs: payloadLegs,
         interval: selectedInterval,
-        days: parseInt(selectedDays),
+        days: parseInt(selectedDays, 10),
       })
       if (res.status === 'success' && res.data) {
         chartDataRef.current = res.data
@@ -449,8 +485,15 @@ export default function StrategyChartTab({
     } finally {
       setIsLoading(false)
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [underlying, exchange, identity, selectedInterval, selectedDays, applyDataToChart, optionExchange])
+  }, [
+    underlying,
+    exchange,
+    identity,
+    selectedInterval,
+    selectedDays,
+    applyDataToChart,
+    optionExchange,
+  ])
 
   // Auto-refetch on leg/interval/days changes. Debounced so rapid leg edits
   // (template pick, batch add) don't hammer the broker — the backend already
@@ -467,10 +510,7 @@ export default function StrategyChartTab({
     return chartData.series[chartData.series.length - 1]
   }, [chartData])
 
-  const hasFuturesLeg = useMemo(
-    () => legs.some((l) => l.segment === 'FUTURE' && l.active),
-    [legs]
-  )
+  const hasFuturesLeg = useMemo(() => legs.some((l) => l.segment === 'FUTURE' && l.active), [legs])
 
   const activeOptionLegs = useMemo(
     () => legs.filter((l) => l.segment === 'OPTION' && l.active && l.symbol).length,
@@ -534,7 +574,12 @@ export default function StrategyChartTab({
             </div>
             <div>
               <span className="text-muted-foreground">
-                Entry {chartData.tag === 'credit' ? 'Credit' : chartData.tag === 'debit' ? 'Debit' : 'Net'}{' '}
+                Entry{' '}
+                {chartData.tag === 'credit'
+                  ? 'Credit'
+                  : chartData.tag === 'debit'
+                    ? 'Debit'
+                    : 'Net'}{' '}
               </span>
               <span className="font-medium" style={{ color: colors.combined }}>
                 {chartData.entry_abs_premium.toFixed(2)}
@@ -590,7 +635,10 @@ export default function StrategyChartTab({
             showCombined ? 'bg-muted font-medium' : 'opacity-50 hover:opacity-75'
           }`}
         >
-          <span className="inline-block h-0.5 w-5 rounded" style={{ backgroundColor: colors.combined }} />
+          <span
+            className="inline-block h-0.5 w-5 rounded"
+            style={{ backgroundColor: colors.combined }}
+          />
           Strategy
         </button>
         <button

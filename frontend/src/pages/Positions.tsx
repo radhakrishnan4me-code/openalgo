@@ -1,6 +1,7 @@
 import {
   AlertTriangle,
   ArrowUpDown,
+  ChartCandlestick,
   ChevronDown,
   ChevronRight,
   Download,
@@ -14,8 +15,6 @@ import {
   X,
 } from 'lucide-react'
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { useOrderEventRefresh } from '@/hooks/useOrderEventRefresh'
-import { showToast } from '@/utils/toast'
 import { tradingApi } from '@/api/trading'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import {
@@ -52,12 +51,15 @@ import {
   TableRow,
 } from '@/components/ui/table'
 import { useLivePrice } from '@/hooks/useLivePrice'
+import { useOrderEventRefresh } from '@/hooks/useOrderEventRefresh'
 import { usePageVisibility } from '@/hooks/usePageVisibility'
+import { useSupportedExchanges } from '@/hooks/useSupportedExchanges'
 import { cn, makeFormatCurrency, sanitizeCSV } from '@/lib/utils'
 import { useAuthStore } from '@/stores/authStore'
-import { useSupportedExchanges } from '@/hooks/useSupportedExchanges'
 import { onModeChange } from '@/stores/themeStore'
 import type { Position } from '@/types/trading'
+import { showToast } from '@/utils/toast'
+import { EmptyState } from '@/components/ui/empty-state'
 
 const STORAGE_KEY = 'openalgo_positions_prefs'
 
@@ -170,7 +172,11 @@ export default function Positions() {
 
   // Centralized real-time price hook with WebSocket + MultiQuotes fallback
   // Automatically pauses when tab is hidden
-  const { data: enhancedPositions, isLive, isPaused } = useLivePrice(positions, {
+  const {
+    data: enhancedPositions,
+    isLive,
+    isPaused,
+  } = useLivePrice(positions, {
     enabled: positions.length > 0,
     useMultiQuotesFallback: true,
     staleThreshold: 5000,
@@ -192,8 +198,7 @@ export default function Positions() {
             exchange: prefs.filters.exchange || [],
           })
       }
-    } catch (e) {
-    }
+    } catch (_e) {}
   }, [])
 
   // Save preferences to localStorage
@@ -443,15 +448,12 @@ export default function Positions() {
         position.product
       )
       if (response.status === 'success') {
-        showToast.success(
-          response.message || `Position closed for ${position.symbol}`,
-          'positions'
-        )
+        showToast.success(response.message || `Position closed for ${position.symbol}`, 'positions')
         fetchPositions(true)
       } else {
         showToast.error(response.message || 'Failed to close position', 'positions')
       }
-    } catch (err) {
+    } catch (_err) {
       showToast.error('Failed to close position', 'positions')
     }
   }
@@ -465,7 +467,7 @@ export default function Positions() {
       } else {
         showToast.error(response.message || 'Failed to close all positions', 'positions')
       }
-    } catch (err) {
+    } catch (_err) {
       showToast.error('Failed to close all positions', 'positions')
     }
   }
@@ -688,16 +690,16 @@ export default function Positions() {
 
                 {/* Product Type */}
                 {!isCrypto && (
-                <div className="space-y-3">
-                  <Label className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-                    Product Type
-                  </Label>
-                  <div className="flex flex-wrap gap-2">
-                    <FilterChip type="product" value="CNC" label="CNC" />
-                    <FilterChip type="product" value="MIS" label="MIS" />
-                    <FilterChip type="product" value="NRML" label="NRML" />
+                  <div className="space-y-3">
+                    <Label className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                      Product Type
+                    </Label>
+                    <div className="flex flex-wrap gap-2">
+                      <FilterChip type="product" value="CNC" label="CNC" />
+                      <FilterChip type="product" value="MIS" label="MIS" />
+                      <FilterChip type="product" value="NRML" label="NRML" />
+                    </div>
                   </div>
-                </div>
                 )}
 
                 {/* Direction */}
@@ -784,15 +786,16 @@ export default function Positions() {
               Grouped: {grouping === 'underlying' ? 'Underlying' : 'Underlying & Expiry'}
             </Badge>
           )}
-          {!isCrypto && filters.product.map((v) => (
-            <Badge
-              key={v}
-              variant="secondary"
-              className="bg-pink-500/10 text-pink-600 border-pink-500/30"
-            >
-              {v}
-            </Badge>
-          ))}
+          {!isCrypto &&
+            filters.product.map((v) => (
+              <Badge
+                key={v}
+                variant="secondary"
+                className="bg-pink-500/10 text-pink-600 border-pink-500/30"
+              >
+                {v}
+              </Badge>
+            ))}
           {filters.direction.map((v) => (
             <Badge
               key={v}
@@ -867,14 +870,16 @@ export default function Positions() {
           ) : error ? (
             <div className="text-center py-12 text-muted-foreground">{error}</div>
           ) : filteredPositions.length === 0 ? (
-            <div className="text-center py-12 text-muted-foreground">
-              <p className="mb-4">No positions match your filters</p>
-              {hasActiveFilters && (
+            <EmptyState
+              icon={ChartCandlestick}
+              title="No positions match your filters"
+              description="Try adjusting or clearing your filters to see results."
+              action={hasActiveFilters ?
                 <Button variant="ghost" size="sm" onClick={clearFilters}>
                   Clear Filters
-                </Button>
-              )}
-            </div>
+                </Button> : undefined
+              }
+            />
           ) : (
             <div className="overflow-x-auto">
               <Table>
@@ -956,14 +961,14 @@ export default function Positions() {
                                 </Badge>
                               </TableCell>
                               {!isCrypto && (
-                              <TableCell className="w-[80px]">
-                                <Badge
-                                  variant="outline"
-                                  className={PRODUCT_COLORS[position.product] || ''}
-                                >
-                                  {position.product}
-                                </Badge>
-                              </TableCell>
+                                <TableCell className="w-[80px]">
+                                  <Badge
+                                    variant="outline"
+                                    className={PRODUCT_COLORS[position.product] || ''}
+                                  >
+                                    {position.product}
+                                  </Badge>
+                                </TableCell>
                               )}
                               <TableCell
                                 className={cn(

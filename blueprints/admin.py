@@ -1482,26 +1482,45 @@ def _check_db_read():
 
 
 def _check_loopback_http():
-    """HEAD / on the local Flask app — measures internal request latency."""
+    """HEAD the local Flask app — measures internal request latency.
+
+    Two candidate targets, because the listening topology differs by install:
+      - Docker / dev server: gunicorn (or Flask) listens on TCP
+        127.0.0.1:{FLASK_PORT|PORT}.
+      - Ubuntu install.sh: gunicorn binds to a UNIX SOCKET behind nginx — no
+        TCP port answers locally, so HOST_SERVER via nginx is the only
+        loopback that works (same resolution as blueprints/mcp_http.py).
+    Trying only the TCP port made this check a guaranteed false alarm on
+    every native Ubuntu install (GitHub issue #1483).
+    """
     import time
     import urllib.request
 
-    started = time.perf_counter()
-    try:
-        # FLASK_PORT is the canonical OpenAlgo var; PORT is the Docker/Railway
-        # convention (gunicorn binds to ${PORT:-5000} in start.sh).
-        port = os.getenv("FLASK_PORT") or os.getenv("PORT") or "5000"
-        req = urllib.request.Request(f"http://127.0.0.1:{port}/", method="HEAD")
-        with urllib.request.urlopen(req, timeout=3.0) as resp:
-            elapsed = round((time.perf_counter() - started) * 1000, 1)
-            return {
-                "name": "Loopback HTTP",
-                "ok": resp.status < 500,
-                "ms": elapsed,
-                "detail": f"HTTP {resp.status}",
-            }
-    except Exception as e:
-        return {"name": "Loopback HTTP", "ok": False, "ms": None, "detail": str(e)[:200]}
+    # FLASK_PORT is the canonical OpenAlgo var; PORT is the Docker/Railway
+    # convention (gunicorn binds to ${PORT:-5000} in start.sh).
+    port = os.getenv("FLASK_PORT") or os.getenv("PORT") or "5000"
+    targets = [f"http://127.0.0.1:{port}/"]
+    host_server = (os.getenv("HOST_SERVER") or "").strip().rstrip("/")
+    if host_server and "127.0.0.1" not in host_server and "localhost" not in host_server:
+        targets.append(f"{host_server}/")
+
+    last_error = "no target answered"
+    for target in targets:
+        started = time.perf_counter()
+        try:
+            req = urllib.request.Request(target, method="HEAD")
+            with urllib.request.urlopen(req, timeout=3.0) as resp:
+                elapsed = round((time.perf_counter() - started) * 1000, 1)
+                label = "direct" if "127.0.0.1" in target else "via nginx (unix-socket bind)"
+                return {
+                    "name": "Loopback HTTP",
+                    "ok": resp.status < 500,
+                    "ms": elapsed,
+                    "detail": f"HTTP {resp.status} ({label})",
+                }
+        except Exception as e:
+            last_error = str(e)
+    return {"name": "Loopback HTTP", "ok": False, "ms": None, "detail": last_error[:200]}
 
 
 def _check_websocket_proxy():
@@ -1646,8 +1665,6 @@ def _render_report(payload, errors_summary, errors_recent, fmt):
     bullet = "- " if is_md else "  - "
     h1 = "# " if is_md else ""
     h2 = "## " if is_md else ""
-    code_open = "```\n" if is_md else ""
-    code_close = "```\n" if is_md else ""
 
     lines = []
     lines.append(f"{h1}OpenAlgo System Report")
@@ -1956,7 +1973,8 @@ def api_oauth_client_approve(client_id):
         return jsonify({"status": "error", "message": "Remote MCP is not enabled."}), 400
 
     try:
-        from database.oauth_db import OAuthClient, db_session as oauth_session
+        from database.oauth_db import OAuthClient
+        from database.oauth_db import db_session as oauth_session
 
         client = OAuthClient.query.filter_by(client_id=client_id).first()
         if client is None:
@@ -2188,8 +2206,8 @@ def api_mcp_kill_switch():
 # The PUT endpoint surfaces this clearly via restart_required=true.
 
 import re
-import stat as _stat
 
+from utils.env_check import _atomic_replace_text
 
 _ENV_KEY_PATTERN = re.compile(r"^([A-Z][A-Z0-9_]*)$")
 
@@ -2214,17 +2232,21 @@ def _read_env_bool(key: str, default: bool) -> bool:
 
 
 def _set_env_value(env_path: Path, key: str, value: str) -> None:
-    """Atomically update or append KEY = 'VALUE' in .env, preserving mode.
+    """Update or append ``KEY = 'VALUE'`` in .env.
 
     Matches the existing single-quoted style install.sh writes. Quotes
     and backslashes inside the value are forbidden — the only callers
     here pass booleans and a validated HTTPS URL, so escaping isn't
     needed and rejecting odd input is safer than encoding it.
+
+    Persistence goes through ``utils.env_check._atomic_replace_text``
+    which falls back to in-place truncate on Docker single-file bind
+    mounts (rename(2) over a mountpoint returns EBUSY/EXDEV).
     """
     if not _ENV_KEY_PATTERN.match(key):
         raise ValueError(f"Refusing to write malformed env key: {key!r}")
     if "'" in value or "\\" in value or "\n" in value:
-        raise ValueError(f"Refusing to write env value containing quote/backslash/newline")
+        raise ValueError("Refusing to write env value containing quote/backslash/newline")
 
     new_line = f"{key} = '{value}'\n"
     if not env_path.exists():
@@ -2245,14 +2267,12 @@ def _set_env_value(env_path: Path, key: str, value: str) -> None:
             lines[-1] = lines[-1] + "\n"
         lines.append(new_line)
 
-    original_mode = _stat.S_IMODE(env_path.stat().st_mode)
-    tmp_path = env_path.with_name(env_path.name + ".tmp")
-    tmp_path.write_text("".join(lines))
-    try:
-        tmp_path.chmod(original_mode)
-    except OSError:
-        pass  # cross-fs or unprivileged — atomic replace below still works
-    tmp_path.replace(env_path)
+    # Reuse the rotate_pepper helper: it already handles the Docker single-file
+    # bind-mount case (install-docker.sh maps ./.env:/app/.env, which makes
+    # /app/.env a mountpoint that rename(2) refuses to overwrite — EBUSY/EXDEV)
+    # plus Windows ERROR_ACCESS_DENIED retries. See issue #1337 for the user
+    # report on the admin MCP-settings save path.
+    _atomic_replace_text(str(env_path), "".join(lines))
 
 
 def _mcp_settings_payload() -> dict:

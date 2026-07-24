@@ -34,7 +34,11 @@ export function useOptionChainPolling(
   exchange: string,
   expiryDate: string,
   strikeCount: number,
-  options: UseOptionChainPollingOptions = { enabled: true, refreshInterval: 30000, pauseWhenHidden: true }
+  options: UseOptionChainPollingOptions = {
+    enabled: true,
+    refreshInterval: 30000,
+    pauseWhenHidden: true,
+  }
 ) {
   const { enabled, refreshInterval = 30000, pauseWhenHidden = true } = options
   const { isVisible } = usePageVisibility()
@@ -55,6 +59,7 @@ export function useOptionChainPolling(
   // this, useOptionChainLive briefly pairs the prior chain's option symbols
   // with the newly-switched optionExchange (e.g. NFO:SENSEX..., BFO:NIFTY...),
   // which the broker rejects as invalid subscriptions.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: these deps are intentional reset triggers — the body only resets state, but it MUST re-fire whenever the request identity (apiKey/underlying/exchange/expiryDate/strikeCount) changes to avoid pairing a stale chain with a newly-switched exchange
   useEffect(() => {
     setState((prev) => ({ ...prev, data: null, lastUpdate: null }))
   }, [apiKey, underlying, exchange, expiryDate, strikeCount])
@@ -143,7 +148,7 @@ export function useOptionChainPolling(
         clearInterval(intervalRef.current)
         intervalRef.current = null
       }
-      setState((prev) => ({ ...prev, isPaused: !enabled ? false : true }))
+      setState((prev) => ({ ...prev, isPaused: !!enabled }))
       return
     }
 

@@ -142,18 +142,22 @@ class NubraWebSocketAdapter(BaseBrokerWebSocketAdapter):
             self.broker_name = broker_name
 
             # Get auth token from database
-            auth_token = get_auth_token(user_id)
+            auth_token = get_auth_token(user_id, bypass_cache=True)
             if not auth_token:
                 return self._create_error_response(
                     "AUTH_ERROR", "Authentication token not found"
                 )
 
-            # Create streaming WebSocket client (extends existing NubraWebSocket)
+            # Create streaming WebSocket client (extends existing NubraWebSocket).
+            # Pass a token_provider so the client re-reads a fresh auth token from
+            # the database before each reconnect; Indian broker tokens roll over
+            # daily (~3 AM IST) and the construction-time token is dead afterward.
             self.ws_client = _StreamingNubraWebSocket(
                 auth_token=auth_token,
                 on_index_data=self._on_index_data,
                 on_orderbook_data=self._on_orderbook_data,
                 on_ohlcv_data=self._on_ohlcv_data,
+                token_provider=self._get_fresh_auth_token,
             )
 
             self.running = True
@@ -163,6 +167,22 @@ class NubraWebSocketAdapter(BaseBrokerWebSocketAdapter):
         except Exception as e:
             self.logger.error(f"Error initializing adapter: {e}")
             return self._create_error_response("INIT_ERROR", str(e))
+
+    def _get_fresh_auth_token(self) -> str | None:
+        """
+        Re-read a fresh auth token from the database for the current user.
+
+        Used as the token_provider for the Nubra WebSocket client so reconnects
+        after the daily token rollover (~3 AM IST) pick up a live token. Returns
+        None on failure so the client keeps its existing token.
+        """
+        if not self.user_id:
+            return None
+        try:
+            return get_auth_token(self.user_id, bypass_cache=True)
+        except Exception as e:
+            self.logger.warning(f"Failed to re-read fresh Nubra auth token: {e}")
+            return None
 
     def connect(self) -> dict[str, Any]:
         """Connect to Nubra WebSocket."""
@@ -789,13 +809,47 @@ class NubraWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 key = f"{exchange}:{symbol}"
                 modes = self.symbol_modes.get(key, set()).copy()
 
-            if not modes or 3 not in modes:
+            if not modes:
                 return
 
             # Extract common data
             ltp = obj.ltp / 100.0 if obj.ltp else 0
             volume = obj.volume if obj.volume else 0
             timestamp = obj.timestamp if obj.timestamp else int(time.time() * 1000)
+
+            # The orderbook channel is the ONLY feed for non-index
+            # instruments, so fan out every subscribed mode from it
+            # (issue #1664). The old early-return on "3 not in modes"
+            # starved LTP/Quote subscribers entirely for stocks.
+            if 1 in modes:
+                self.publish_market_data(
+                    f"{exchange}_{symbol}_LTP",
+                    {
+                        "symbol": symbol,
+                        "exchange": exchange,
+                        "mode": "ltp",
+                        "ltp": ltp,
+                        "timestamp": timestamp,
+                    },
+                )
+            if 2 in modes:
+                bid0 = obj.bids[0].price / 100.0 if obj.bids and obj.bids[0].price else 0
+                ask0 = obj.asks[0].price / 100.0 if obj.asks and obj.asks[0].price else 0
+                self.publish_market_data(
+                    f"{exchange}_{symbol}_QUOTE",
+                    {
+                        "symbol": symbol,
+                        "exchange": exchange,
+                        "mode": "quote",
+                        "ltp": ltp,
+                        "volume": volume,
+                        "bid": bid0,
+                        "ask": ask0,
+                        "timestamp": timestamp,
+                    },
+                )
+            if 3 not in modes:
+                return
 
             # Build depth data
             bids = [

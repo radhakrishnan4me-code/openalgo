@@ -4,10 +4,31 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-OpenAlgo is a production-ready algorithmic trading platform built with Flask (backend) and React 19 (frontend). It provides a unified API layer across 30+ Indian brokers, enabling seamless integration with TradingView, Amibroker, Excel, Python, and AI agents.
+OpenAlgo is a production-ready algorithmic trading platform built with Flask (backend) and React 19 (frontend). It is **four products in one self-hosted instance**, all sharing a single broker session and WebSocket feed:
+
+| Surface | Route | Purpose |
+| --- | --- | --- |
+| **Unified Broker API** | `/api/v1/` | External platforms (TradingView, Amibroker, ChartInk, Excel, Python, MCP) |
+| **Python Strategy Host** | `/python` | In-browser CodeMirror editor — paste scripts, schedule on IST times, run parallel strategies with process isolation and live logs |
+| **Flow (No-Code Builder)** | `/flow` | Drag-and-drop nodes: market data → indicators → conditions → order execution; JSON import/export |
+| **Options Trading Suite** | `/tools` | 12 analytical tools: Strategy Builder, Option Chain, IV Smile, Max Pain, Vol Surface, GEX, OI Tracker, Straddle Chart, etc. |
+
+All surfaces share the Sandbox engine (₹1 Crore sandbox capital, exchange-aligned auto square-off) and support Telegram alerts.
 
 **Repository**: https://github.com/marketcalls/openalgo
 **Documentation**: https://docs.openalgo.in
+
+## Documentation Map
+
+All project documentation lives under `docs/` as markdown (the single source of
+truth). **Start from [`docs/INDEX.md`](docs/INDEX.md)** — it maps every area
+(REST API, Python SDK, indicators, user guide, BDD specs, PRDs, design, scalping,
+installation, audits) to its entry file.
+
+When answering a question, read `docs/INDEX.md` first, then open only the
+specific doc you need (progressive disclosure) instead of scanning the whole
+tree. Do **not** copy or restate docs into a second location — edit the source
+file in `docs/` and every reader sees the change.
 
 ## Security and Deployment Model
 
@@ -23,7 +44,7 @@ OpenAlgo is a production-ready algorithmic trading platform built with Flask (ba
 
 ### Prerequisites
 - Python 3.12+ (required per pyproject.toml)
-- Node.js 20/22/24 for React frontend development
+- Node.js 20.20+, 22.22+, or 24.13+ for React frontend development (per `frontend/package.json`)
 - **uv package manager (required)** - Never use global Python
 
 ### Initial Setup
@@ -99,7 +120,7 @@ npm run format
 - `app.py` - Main Flask application entry point
 - `blueprints/` - Flask route handlers (UI and webhooks)
 - `restx_api/` - REST API endpoints (`/api/v1/`)
-- `broker/` - Broker integrations (30+ brokers), each with `api/`, `database/`, `mapping/`, `streaming/`, `plugin.json`
+- `broker/` - Broker integrations (34 brokers), each with `api/`, `database/`, `mapping/`, `streaming/`, `plugin.json`
 - `services/` - Business logic layer
 - `database/` - SQLAlchemy models and database utilities
 - `utils/` - Shared utilities and helpers
@@ -113,7 +134,7 @@ OpenAlgo uses **6 separate databases** for isolation:
 - `db/logs.db` - Traffic and API logs
 - `db/latency.db` - Latency monitoring data
 - `db/health.db` - Health monitoring data
-- `db/sandbox.db` - Analyzer/sandbox mode (isolated sandbox trading)
+- `db/sandbox.db` - Sandbox trading mode (isolated from live trading)
 - `db/historify.duckdb` - Historical market data (DuckDB)
 
 Each database has its own initialization function in `/database/`.
@@ -134,7 +155,7 @@ Broker API calls use `httpx` with HTTP/2 connection pooling (`utils/httpx_client
 
 ### Broker Integration Pattern
 
-All 30+ brokers follow a standardized structure in `broker/{broker_name}/`:
+All 34 brokers follow a standardized structure in `broker/{broker_name}/`:
 
 1. `api/auth_api.py` - OAuth2 or API key based authentication
 2. `api/order_api.py` - Place, modify, cancel orders
@@ -156,6 +177,50 @@ Real-time market data flows through a three-layer pipeline:
 2. **ZeroMQ Message Bus** (port 5555): Broker adapters publish normalized tick data to a ZeroMQ PUB socket. This decouples the broker feed from client delivery — the broker adapter runs independently and never blocks on slow clients.
 
 3. **Unified WebSocket Proxy Server** (`websocket_proxy/server.py`, port 8765): Subscribes to ZeroMQ, manages client WebSocket connections, handles symbol subscriptions/unsubscriptions, and delivers filtered ticks to each connected client. Includes per-symbol throttling to prevent flooding slow clients.
+
+#### ZeroMQ bus invariant — SUB binds, PUBs connect (do not break this)
+
+The ZMQ market-data bus (`ZMQ_PORT`, default 5555) is **fan-in**: the proxy's
+SUB (`websocket_proxy/server.py`) is the **single binder**, and **every publisher
+CONNECTs to it** — the broker market-data adapters (`base_adapter._connect_to_zmq_bus`
+and `connection_manager.SharedZmqPublisher.connect`) and the cache-invalidation
+publisher (`database/cache_invalidation.py`). Rules that MUST hold:
+
+- **Never make a publisher `bind()`.** Publishers connect; only the proxy SUB binds. ZMQ allows many PUBs to connect to one bound SUB (fan-in), so multiple publishers across processes share one fixed port with no contention.
+- **`ZMQ_PORT` is fixed by config and never drifts.** No port-scan, no `5555 → 5556` fallback, no runtime mutation of `os.environ["ZMQ_PORT"]`. A single instance stays on its configured port forever; `install-multi.sh` gives each instance its own `ZMQ_PORT` (`5555 + i-1`) and each stays put.
+- **Why this matters:** under gunicorn+eventlet the proxy runs *out-of-process* (a subprocess on bare-metal `install.sh`, or a separate `python -m websocket_proxy.server` on Docker `start.sh`), while the cache-invalidation publisher runs in the gunicorn process. If a publisher binds, the two processes race for the port; the loser silently slides to the next port while the SUB stays on the configured one, so **`subscribe` succeeds but no ticks are delivered** (works fine on the single-process dev server, broken only on eventlet servers — historically hard to spot). Keeping the SUB as the sole binder removes the race entirely. This applies to **all brokers** — the bus is broker-agnostic.
+
+#### Multi-session login must not tear down the shared broker feed (do not break this)
+
+OpenAlgo is single-user / single-broker per instance, but the *same* user may be
+logged in from **multiple devices/browsers at once** (`active_sessions`, cap
+`MAX_SESSIONS_PER_USER = 5`). All those sessions share **one** server-side broker
+WebSocket feed — a single connection pool keyed `{broker}_{user_id}` in
+`websocket_proxy/broker_factory.py:_POOLED_ADAPTERS`, fanned out to every browser
+client by the proxy. A second device must be able to stream **without interrupting
+the first**.
+
+The hazard: a 2nd-device login resumes the existing broker session
+(`blueprints/auth._try_resume_broker_session`) and re-persists the **same** token
+through `database.auth_db.upsert_auth`. `upsert_auth` is also what tears the shared
+feed down — it publishes a ZMQ `CACHE_INVALIDATE_ALL` (the out-of-process proxy's
+`_handle_cache_invalidation` disconnects the adapter + pool) and calls
+`cleanup_pools_for_user` in-process. That teardown is **only correct when the token
+actually changed** (real login, daily ~3 AM token rollover, logout/revoke). Rules
+that MUST hold:
+
+- **Gate the teardown on a real token change.** `upsert_auth` compares the new
+  token/feed-token/broker/revoke flag against the stored row (decrypted plaintext —
+  Fernet ciphertext is non-deterministic, so never compare the encrypted blobs). If
+  nothing material changed it clears the cheap in-process caches and returns early,
+  leaving the live feed up. Only a genuine change (or `revoke=True`) runs the
+  ZMQ-publish + `cleanup_pools_for_user` path.
+- **Why this matters:** without the gate, a 2nd-device login on the same day kills
+  the 1st device's stream until it refreshes (Shoonya), and on single-active-session
+  Finvasia/Noren brokers the disconnect/reconnect churn drops the broker token
+  entirely (Flattrade "broker session expired"). See issue #1591. The teardown
+  itself still exists for the changed-token case — do not remove it (it is the
+  #1394/#765/#851 fix); just keep it gated. This is broker-agnostic.
 
 ### Request Processing Pipeline
 
@@ -301,13 +366,25 @@ Orders can flow through two modes:
 
 Approval workflow in `database/action_center_db.py` and `services/action_center_service.py`
 
-### Analyzer Mode (Sandbox Trading)
+### Sandbox Trading Mode
 
 Separate database (`sandbox.db`) with ₹1 Crore sandbox capital:
 - Realistic margin system with leverage
 - Auto square-off at exchange timings
 - Complete isolation from live trading
-- Toggle via `/analyzer` blueprint
+- Sandbox controls (capital, leverage, reset schedule) live at `/sandbox` (`blueprints/sandbox.py`); request/response inspection is at `/analyzer` (`blueprints/analyzer.py`)
+
+### Python Strategy Host
+
+In-browser Python editor (`blueprints/python_strategy.py`) powered by **APScheduler** (`services/historify_scheduler_service.py` and `services/flow_scheduler_service.py` share the same scheduler instance). Each strategy runs in a subprocess for process isolation. Logs stream to the UI via SocketIO. Strategy metadata is persisted in `openalgo.db` via `database/strategy_db.py`.
+
+### Flow (No-Code Builder)
+
+Node-based visual strategy builder (`blueprints/flow.py`). Flow definitions are stored as JSON in `database/flow_db.py`. At runtime, `services/flow_executor_service.py` interprets the node graph, `services/flow_price_monitor_service.py` watches live prices, and `services/flow_scheduler_service.py` manages scheduled triggers via APScheduler.
+
+### MCP Integration
+
+Two MCP endpoints exist: `blueprints/mcp_http.py` (streamable HTTP transport for MCP) and `blueprints/mcp_oauth.py` (OAuth2 authorization for remote MCP clients). OAuth state is stored in `database/oauth_db.py`. The stdio MCP server (`mcp/mcpserver.py`) remains local-only.
 
 ### Real-Time Communication (Event-Driven Architecture)
 
@@ -343,7 +420,7 @@ Critical variables to configure:
 
 There are **two independent versions** in this repo. Do not confuse them.
 
-### 1. Platform version (e.g. `2.0.0.6`)
+### 1. Platform version (e.g. `2.0.1.0`)
 
 This is the OpenAlgo platform itself. Source of truth: `utils/version.py`. Bumping touches **two files** and regenerates the lockfile — **never** the requirements files.
 
@@ -352,15 +429,15 @@ This is the OpenAlgo platform itself. Source of truth: `utils/version.py`. Bumpi
 3. Run `uv sync` to regenerate `uv.lock` with the new version
 
 ```bash
-# Example: bumping platform 2.0.0.6 → 2.0.0.7
-# 1. Edit utils/version.py     → VERSION = "2.0.0.7"
-# 2. Edit pyproject.toml line 4 → version = "2.0.0.7"
+# Example: bumping platform 2.0.1.0 → 2.0.1.1
+# 1. Edit utils/version.py     → VERSION = "2.0.1.1"
+# 2. Edit pyproject.toml line 4 → version = "2.0.1.1"
 # 3. Sync the lockfile
 uv sync
 
 # 4. Verify
 uv run python -c "from utils.version import get_version; print(get_version())"
-# → 2.0.0.7
+# → 2.0.1.1
 ```
 
 The platform version surfaces in:
@@ -388,10 +465,28 @@ uv sync
 ## Code Style and Conventions
 
 ### Python
-- Follow PEP 8 style guide
+
+The project uses **Ruff** for linting and formatting (configured in `pyproject.toml`):
+
+```bash
+uv run ruff check .          # lint (errors + warnings)
+uv run ruff check . --fix    # auto-fix safe issues
+uv run ruff format .         # format (replaces Black)
+```
+
+Ruff rules enabled: `E`, `F`, `W` (pycodestyle/pyflakes), `I` (isort), `B` (bugbear), `C4` (comprehensions), `UP` (pyupgrade). Line-length 100, target Python 3.12. Directories excluded: `.venv`, `frontend`, `db`, `log`, `strategies`.
+
 - Use 4 spaces for indentation
 - Use Google-style docstrings
 - Imports: Standard library → Third-party → Local
+
+Dev security tooling (in `dev` dependency group):
+
+```bash
+uv run --group dev bandit -r . -x .venv,frontend   # security scan
+uv run --group dev pip-audit                        # CVE check on deps
+uv run --group dev detect-secrets scan              # secret leak scan
+```
 
 ### React/TypeScript
 - Follow Biome.js linting rules (`frontend/biome.json`)
@@ -421,7 +516,7 @@ API keys are generated at `/apikey` and hashed with pepper before storage.
 
 ### Symbol Format
 
-OpenAlgo uses a standardized symbol format across all 30+ brokers. Broker-specific symbols are mapped via `broker/*/mapping/` modules and stored in the `SymToken` table.
+OpenAlgo uses a standardized symbol format across all 34 brokers. Broker-specific symbols are mapped via `broker/*/mapping/` modules and stored in the `SymToken` table.
 
 **Equity:** Just the base symbol — `INFY`, `SBIN`, `TATAMOTORS`
 
@@ -521,6 +616,9 @@ All error logging uses `logger.exception()` (not `logger.error()` + manual trace
 
 ## Claude Code Instructions
 
+### No Icons or Emojis
+- Do not use icons or emojis anywhere: source code, comments, loggers, commit messages, PR descriptions, changelogs, release notes, or any generated text (including messages drafted for Discord, Telegram, or other channels). Use plain text labels instead.
+
 ### Frontend Build Process
 - The React frontend dist is force-committed to `main` by CI (`commit-dist` job in `.github/workflows/ci.yml`). Production servers and backend-only contributors do NOT need Node.js or npm — a plain `git pull` from `main` already brings the latest UI.
 - When actively editing React code, run `cd frontend && npm install && npm run build` (build only, no tests). Tests run in CI; not required for local iteration.
@@ -570,3 +668,9 @@ This project is indexed by GitNexus as **openalgo** (37037 symbols, 61394 relati
 | Index, status, clean, wiki CLI commands | `.claude/skills/gitnexus/gitnexus-cli/SKILL.md` |
 
 <!-- gitnexus:end -->
+
+### File Descriptor (FD) Hygiene
+- Be FD-aware while coding: every DB engine/session, file, socket, WebSocket, ZeroMQ socket, subprocess pipe, thread, and executor is a file descriptor — prefer `with` context managers or shared singletons and guarantee close/reap on every path (success, error, and reconnect); preventing a leak at creation is far cheaper than hunting it later.
+- After building a feature or fixing anything that touches DB, WebSockets/streaming, threads/executors, subprocesses, files, or sockets, intelligently run a focused FD audit of just that change before calling it done.
+- Honor the conventions: all SQLite engines via `database.engine_factory.create_db_engine()` (NullPool), every `scoped_session` registered in the `app.py` teardown or used as `with db_session() as session:`, HTTP via the shared `utils/httpx_client.get_httpx_client()`, WebSocket adapters close-before-reconnect, subprocesses write to a log file (not PIPE) and are `.wait()`-reaped, and threads/executors are shared module-level singletons (never per-call).
+- If the audit finds an FD that is not released, do not silently proceed: tell the user exactly where it leaks and why it matters (a long-running single-worker Gunicorn/eventlet process accumulates descriptors until it hits the OS limit — "too many open files", refused DB connections, dropped sockets, eventual crash or forced restart), and ask them to approve the fix.

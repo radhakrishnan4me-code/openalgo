@@ -56,6 +56,7 @@ from .telegram_bot import api as telegram_ns
 from .ticker import api as ticker_ns
 from .tradebook import api as tradebook_ns
 from .bracket_order import api as bracket_order_ns
+from .whatsapp_bot import api as whatsapp_ns
 
 # Add namespaces
 api.add_namespace(bracket_order_ns, path="/bracketorder")
@@ -93,6 +94,7 @@ api.add_namespace(synthetic_future_ns, path="/syntheticfuture")
 api.add_namespace(analyzer_ns, path="/analyzer")
 api.add_namespace(ping_ns, path="/ping")
 api.add_namespace(telegram_ns, path="/telegram")
+api.add_namespace(whatsapp_ns, path="/whatsapp")
 api.add_namespace(margin_ns, path="/margin")
 api.add_namespace(instruments_ns, path="/instruments")
 api.add_namespace(chart_ns, path="/chart")

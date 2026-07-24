@@ -86,7 +86,7 @@ def check_tmp_noexec() -> None:
                     mount_options = parts[3].split(',')
                     if 'noexec' in mount_options:
                         print("\n" + "=" * 70)
-                        print("⚠️  WARNING: /tmp is mounted with 'noexec' flag")
+                        print("WARNING: /tmp is mounted with 'noexec' flag")
                         print("   This can cause issues with Python libraries like numba/llvmlite.")
                         print("")
                         print("   OpenAlgo has auto-configured alternative paths:")
@@ -152,7 +152,7 @@ def check_env_version_compatibility() -> bool:
     # If either version is missing, warn but continue
     if not env_version:
         print("\n" + "=" * 70)
-        print("⚠️  WARNING: No version found in your .env file")
+        print("WARNING: No version found in your .env file")
         print("   Your .env file may be outdated and missing new configuration options.")
         print("   Consider updating it with new variables from .sample.env")
         print("=" * 70)
@@ -180,24 +180,35 @@ def check_env_version_compatibility() -> bool:
         sample_ver = version_tuple(sample_version)
 
         if env_ver < sample_ver:
-            print("\n" + "🔴 " + "=" * 68)
-            print("🔴  CONFIGURATION UPDATE REQUIRED")
-            print("🔴 " + "=" * 68)
+            print("\n" + "=" * 70)
+            print("  CONFIGURATION UPDATE REQUIRED")
+            print("=" * 70)
             print(f"   Your .env version: {env_version}")
             print(f"   Required version:  {sample_version}")
             print("")
             print("   ACTION NEEDED:")
-            print("   1. Backup your current .env file")
+            print("   1. Backup your current .env file  (cp .env .env.backup)")
             print("   2. Compare .env with .sample.env")
             print("   3. Add any missing configuration variables to your .env")
             print("   4. Update ENV_CONFIG_VERSION in your .env to match .sample.env")
             print("")
+            print("   ADD the missing variables to your existing .env. Do NOT copy")
+            print("   .sample.env over it. These three values are unrecoverable and")
+            print("   must keep the values your install is already using:")
+            print("")
+            print("     API_KEY_PEPPER  - hashes your password and encrypts your")
+            print("                       broker tokens. Change it and you can never")
+            print("                       log in again; the hash is one-way.")
+            print("     FERNET_SALT     - encrypts the same data alongside the pepper.")
+            print("     APP_KEY         - signs session cookies (safe to change, but")
+            print("                       every logged-in browser is signed out).")
+            print("")
             print("   New features may not work properly with an outdated configuration!")
-            print("🔴 " + "=" * 68)
+            print("=" * 70)
 
             # Give user a chance to continue anyway
             try:
-                response = input("\n⚠️  Continue anyway? (y/N): ").lower().strip()
+                response = input("\nContinue anyway? (y/N): ").lower().strip()
                 if response not in ["y", "yes"]:
                     print("\nApplication startup cancelled. Please update your .env file.")
                     return False
@@ -206,7 +217,7 @@ def check_env_version_compatibility() -> bool:
                 return False
 
         elif env_ver > sample_ver:
-            print(f"\n✅ Your .env version ({env_version}) is newer than sample ({sample_version})")
+            print(f"\nYour .env version ({env_version}) is newer than sample ({sample_version})")
 
         else:
             # Only print success message in Flask child process (avoids duplicate message with debug reloader)
@@ -216,7 +227,7 @@ def check_env_version_compatibility() -> bool:
             is_reloader_parent = flask_debug and os.environ.get("WERKZEUG_RUN_MAIN") != "true"
             if not is_reloader_parent:
                 print(
-                    f"\n\033[94m🔄\033[0m Configuration version check passed (\033[92m{env_version}\033[0m)"
+                    f"\nConfiguration version check passed (\033[92m{env_version}\033[0m)"
                 )
 
     except Exception as e:
@@ -330,6 +341,51 @@ _FALLBACK_TO_INPLACE_ERRNOS = frozenset(
 )
 
 
+def _target_needs_inplace_write(path: str) -> bool:
+    """True when ``path`` must be rewritten in place rather than via the
+    tmp-file + ``os.replace`` rename pattern.
+
+    The rename pattern writes ``path + ".tmp"`` (created in ``path``'s parent
+    directory) and atomically renames it onto ``path``. That only works when
+    the tmp file and the target live on the same filesystem. For a Docker
+    single-file bind mount (``./.env:/app/.env``) they do NOT: ``/app/.env`` is
+    on the host mount (one ``st_dev``) while ``/app`` — and therefore
+    ``/app/.env.tmp`` — is the container's overlay filesystem (a different
+    ``st_dev``).
+
+    On most POSIX kernels that cross-device rename fails with ``EXDEV`` and the
+    caller's existing fallback handles it. But on Docker Desktop's virtiofs /
+    gRPC-FUSE the rename SILENTLY SUCCEEDS by shadowing the mount point with a
+    container-local inode: the container sees the new content, but the write
+    never reaches the host ``.env`` and the next container recreation discards
+    it. That is exactly the "env_check says it saved the keys but the host
+    .env still shows placeholders" first-run bug. Detect the mismatch up front
+    so we write through the real inode instead.
+
+    Returns False on any error or when the devices match — the common
+    same-filesystem case (e.g. ``uv run app.py`` against a normal host file) —
+    so the crash-atomic rename path stays the default everywhere it works.
+    """
+    try:
+        parent = os.path.dirname(os.path.abspath(path)) or os.getcwd()
+        if os.stat(path).st_dev != os.stat(parent).st_dev:
+            return True
+    except OSError:
+        return False
+    # Secondary, Linux-only signal: a single-file bind mount appears as a mount
+    # point in /proc/self/mountinfo even on the rare setup where st_dev matches.
+    try:
+        realpath = os.path.realpath(path)
+        with open("/proc/self/mountinfo", encoding="utf-8") as f:
+            for line in f:
+                fields = line.split(" ")
+                if len(fields) > 4 and fields[4] == realpath:
+                    return True
+    except OSError:
+        pass
+    return False
+
+
 def _atomic_replace_text(path: str, content: str) -> None:
     """Atomic-write ``content`` to ``path``, falling back to in-place rewrite
     when the strict atomic pattern can't work in the current environment.
@@ -365,43 +421,50 @@ def _atomic_replace_text(path: str, content: str) -> None:
         except OSError:
             pass
 
-    # Pattern 1 — write tmp + atomic rename.
-    try:
-        with open(tmp, "w", encoding="utf-8", newline="") as f:
-            f.write(content)
-            f.flush()
-            try:
-                os.fsync(f.fileno())
-            except OSError:
-                # fsync failure on tmp is non-fatal — the rename below either
-                # succeeds (durable enough) or we fall through to in-place.
-                pass
-        if os.name != "nt":
-            os.chmod(tmp, 0o600)
+    # Pattern 1 — write tmp + atomic rename. Skipped entirely when the target
+    # is a bind-mounted / separate-filesystem file: there the rename either
+    # fails (EXDEV) or — on Docker Desktop virtiofs — silently shadows the
+    # mount with a container-local inode, so the new content never reaches the
+    # host file. _target_needs_inplace_write detects that up front and we drop
+    # straight to the in-place rewrite below, which writes through the real
+    # inode. See _target_needs_inplace_write for the full rationale.
+    if not _target_needs_inplace_write(path):
+        try:
+            with open(tmp, "w", encoding="utf-8", newline="") as f:
+                f.write(content)
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except OSError:
+                    # fsync failure on tmp is non-fatal — the rename below either
+                    # succeeds (durable enough) or we fall through to in-place.
+                    pass
+            if os.name != "nt":
+                os.chmod(tmp, 0o600)
 
-        last_err = None
-        for _ in range(3):
-            try:
-                os.replace(tmp, path)
-                return
-            except OSError as e:
-                last_err = e
-                if e.errno in _FALLBACK_TO_INPLACE_ERRNOS:
-                    # Cross-FS rename or permission issue — break out to fallback.
-                    break
-                if os.name == "nt":
-                    time.sleep(0.15)
-                    continue
-                # Unrecognised POSIX error — propagate.
+            last_err = None
+            for _ in range(3):
+                try:
+                    os.replace(tmp, path)
+                    return
+                except OSError as e:
+                    last_err = e
+                    if e.errno in _FALLBACK_TO_INPLACE_ERRNOS:
+                        # Cross-FS rename or permission issue — break to fallback.
+                        break
+                    if os.name == "nt":
+                        time.sleep(0.15)
+                        continue
+                    # Unrecognised POSIX error — propagate.
+                    raise
+            if last_err is not None and last_err.errno not in _FALLBACK_TO_INPLACE_ERRNOS:
+                _cleanup_tmp()
+                raise last_err
+        except OSError as e:
+            if e.errno not in _FALLBACK_TO_INPLACE_ERRNOS:
                 raise
-        if last_err is not None and last_err.errno not in _FALLBACK_TO_INPLACE_ERRNOS:
-            _cleanup_tmp()
-            raise last_err
-    except OSError as e:
-        if e.errno not in _FALLBACK_TO_INPLACE_ERRNOS:
-            raise
-        # Tmp creation/fsync hit a recoverable errno (EACCES on /app/.env.tmp
-        # in the user's report). Fall through.
+            # Tmp creation/fsync hit a recoverable errno (EACCES on /app/.env.tmp
+            # in the user's report). Fall through.
 
     _cleanup_tmp()
 
@@ -816,6 +879,17 @@ def _migrate_fernet_db(env_path: str, pepper: str, new_salt: str) -> None:
                 )
                 if cur.fetchone() is None:
                     continue
+                # The encrypted column may not exist yet: on a fresh install
+                # _migrate_fernet_db can run before a later schema migration
+                # adds the column (e.g. flow_workflows.api_key). The table is
+                # present but the column is not — there is nothing to migrate,
+                # so skip it instead of letting the SELECT raise and abort the
+                # whole rotation with a "no such column" warning.
+                existing_cols = {
+                    r[1] for r in conn.execute(f"PRAGMA table_info({table})")
+                }
+                if col not in existing_cols:
+                    continue
                 cur = conn.execute(
                     f"SELECT {pk} AS pk, {col} AS ct FROM {table} "
                     f"WHERE {col} IS NOT NULL AND {col} != ''"
@@ -1003,6 +1077,54 @@ def _generate_keys_on_first_run(env_path: str) -> None:
     # in-place would brick existing Argon2 password hashes and Fernet-encrypted
     # tokens. The dedicated upgrade/rotate_pepper.py migration handles that
     # case explicitly with re-encryption + password reset.
+    #
+    # But silence is the wrong default for that state, so warn — every startup,
+    # not once. Two things are true at the same time here and the operator can
+    # see neither of them:
+    #
+    #   1. The pepper is the value published in .sample.env, so every stored
+    #      broker token / API key / TOTP secret in this DB is decryptable by
+    #      anyone who obtains the file.
+    #   2. If the account was created while a *different* pepper was in effect
+    #      (the usual cause: .sample.env was copied over a working .env), every
+    #      login now fails with a bare "Invalid credentials" and nothing else
+    #      in the app explains why. See issue #1660.
+    if pepper_compromised and db_populated and not is_reloader_parent:
+        sys.stderr.write(
+            "\n\033[91m\033[1m[OpenAlgo security] API_KEY_PEPPER is the public sample value\033[0m\n"
+            "\033[91mYour .env still carries the API_KEY_PEPPER placeholder from\n"
+            ".sample.env, and this database already has a user account.\n"
+            "\n"
+            "It was NOT rotated automatically - rotating it would permanently\n"
+            "destroy your stored password hash and broker tokens.\n"
+            "\n"
+            "Two consequences, both active right now:\n"
+            "\n"
+            "  1. Every broker token, API key and TOTP secret in this database\n"
+            "     is encrypted with a publicly-known value. Treat them as\n"
+            "     exposed and re-issue them once the pepper is fixed.\n"
+            "\n"
+            "  2. If you cannot log in ('Invalid credentials' with a password\n"
+            "     you know is correct), this is why: your account was created\n"
+            "     while a different pepper was in effect, so the stored hash no\n"
+            "     longer matches. This usually happens when .sample.env is\n"
+            "     copied over a working .env during an upgrade.\n"
+            "\n"
+            "To fix:\n"
+            "  - If you have a backup of the .env you set up with, restore its\n"
+            "    API_KEY_PEPPER and FERNET_SALT lines and restart. This is the\n"
+            "    only route that keeps your existing password and tokens.\n"
+            "  - Otherwise, rotate deliberately and reset the password:\n"
+            "      uv run python upgrade/rotate_pepper.py\n"
+            "      uv run python upgrade/reset_admin_password.py\n"
+            "  - On a throwaway install with nothing to keep, deleting\n"
+            "    db/openalgo.db and restarting lets first-run setup generate a\n"
+            "    fresh pepper for you.\n"
+            "\n"
+            "Run 'uv run python upgrade/init_db.py' to see which of these\n"
+            "applies to your install.\n"
+            "\033[0m\n"
+        )
 
 
 def load_and_check_env_variables() -> None:

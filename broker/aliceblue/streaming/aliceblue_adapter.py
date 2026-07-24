@@ -113,7 +113,7 @@ class AliceblueWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 self.logger.info(f"Session ID (JWT) available for auth: {bool(session_id)}")
             else:
                 # Fetch authentication tokens from database
-                auth_token = get_auth_token(user_id)
+                auth_token = get_auth_token(user_id, bypass_cache=True)
                 feed_token = get_feed_token(user_id)
                 self.logger.info(f"From database: auth_token=[REDACTED], feed_token={feed_token}")
                 self.logger.info(f"feed_token type: {type(feed_token)}, value: {repr(feed_token)}")
@@ -980,6 +980,17 @@ class AliceblueWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 return  # Cancelled
             if not self.running:  # Only reconnect if not already running
                 self.logger.info("Attempting to reconnect...")
+                # Re-read fresh auth token from database before reconnecting.
+                # AliceBlue tokens roll over daily at ~3 AM IST; reusing the
+                # construction-time session_id would reconnect with a dead token.
+                if self.user_id:
+                    fresh_token = get_auth_token(self.user_id, bypass_cache=True)
+                    if fresh_token:
+                        self.session_id = fresh_token
+                    else:
+                        self.logger.warning(
+                            "Could not fetch fresh auth token on reconnect; using existing session_id"
+                        )
                 success = self.connect()
                 if success:
                     # Resubscribe to all previous subscriptions

@@ -99,7 +99,7 @@ class DhanWebSocketAdapter(BaseBrokerWebSocketAdapter):
         # Get OAuth access token from database (NOT from BROKER_API_SECRET)
         # BROKER_API_SECRET is the OAuth app secret, not the access token
         if not auth_data:
-            auth_token = get_auth_token(user_id)
+            auth_token = get_auth_token(user_id, bypass_cache=True)
             if not auth_token:
                 self.logger.error(f"No OAuth access token found in database for user {user_id}")
                 raise ValueError(f"No OAuth access token found for user {user_id}")
@@ -114,11 +114,14 @@ class DhanWebSocketAdapter(BaseBrokerWebSocketAdapter):
         # Store the client_id for later use
         self.client_id = client_id
 
-        # Initialize 5-depth WebSocket client
+        # Initialize 5-depth WebSocket client. Pass user_id so the client can
+        # re-read a fresh access token from the database on reconnect (tokens
+        # roll over daily at ~3 AM IST).
         self.ws_client_5depth = DhanWebSocket(
             client_id=client_id,  # Use the actual Dhan client ID
             access_token=auth_token,
             is_20_depth=False,
+            user_id=user_id,
         )
 
         # Initialize 20-depth WebSocket client
@@ -126,6 +129,7 @@ class DhanWebSocketAdapter(BaseBrokerWebSocketAdapter):
             client_id=client_id,  # Use the actual Dhan client ID
             access_token=auth_token,
             is_20_depth=True,
+            user_id=user_id,
         )
 
         # Set callbacks for 5-depth client

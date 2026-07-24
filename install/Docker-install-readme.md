@@ -188,17 +188,17 @@ The script will ask you for:
 
 ### What the Script Does
 
-1. ✅ Updates system packages
-2. ✅ Installs Docker & Docker Compose
-3. ✅ Installs Nginx web server
-4. ✅ Installs Certbot for SSL
-5. ✅ Clones OpenAlgo repository to `/opt/openalgo`
-6. ✅ Configures environment variables
-7. ✅ Sets up firewall (UFW)
-8. ✅ Obtains SSL certificate from Let's Encrypt
-9. ✅ Configures Nginx with SSL and WebSocket support
-10. ✅ Builds and starts Docker container
-11. ✅ Creates management helper scripts
+1. Updates system packages
+2. Installs Docker & Docker Compose
+3. Installs Nginx web server
+4. Installs Certbot for SSL
+5. Clones OpenAlgo repository to `/opt/openalgo`
+6. Configures environment variables
+7. Sets up firewall (UFW)
+8. Obtains SSL certificate from Let's Encrypt
+9. Configures Nginx with SSL and WebSocket support
+10. Builds and starts Docker container
+11. Creates management helper scripts
 
 **Installation typically takes 5-10 minutes.**
 
@@ -506,6 +506,7 @@ sudo rm -rf /var/lib/docker
 | Flattrade | `flattrade` | No |
 | Fyers | `fyers` | No |
 | Groww | `groww` | No |
+| HDFC Sky | `hdfcsky` | No |
 | IBulls | `ibulls` | Yes |
 | IIFL | `iifl` | Yes |
 | Iiflcapital | `iiflcapital` | No |
@@ -521,6 +522,7 @@ sudo rm -rf /var/lib/docker
 | Samco | `samco` | No |
 | Shoonya | `shoonya` | No |
 | Tradejini | `tradejini` | No |
+| TradeSmart | `tradesmart` | No |
 | Upstox | `upstox` | No |
 | Wisdom Capital | `wisdom` | Yes |
 | Zebu | `zebu` | No |

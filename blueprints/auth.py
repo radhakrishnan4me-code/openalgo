@@ -1,6 +1,7 @@
 import os
 import re
 import secrets
+from datetime import UTC, datetime
 
 from flask import (
     Blueprint,
@@ -31,7 +32,7 @@ from utils.email_debug import debug_smtp_connection
 from utils.email_utils import send_password_reset_email, send_test_email
 from utils.ip_helper import get_real_ip
 from utils.logging import get_logger
-from utils.session import check_session_validity
+from utils.session import check_session_validity, is_session_valid, revoke_user_tokens
 
 # Initialize logger
 logger = get_logger(__name__)
@@ -134,6 +135,32 @@ def check_setup_required():
     return jsonify({"status": "success", "needs_setup": needs_setup})
 
 
+def _broker_validation_failure_reason(funds_data):
+    """Return a reason when a broker funds response represents auth/API failure."""
+    if not funds_data:
+        return "empty funds response"
+
+    if not isinstance(funds_data, dict):
+        return None
+
+    status = str(funds_data.get("status", "")).lower()
+    if status in {"error", "failed", "failure"}:
+        return str(
+            funds_data.get("message")
+            or funds_data.get("errorMessage")
+            or funds_data.get("errors")
+            or funds_data.get("error")
+            or "broker returned error status"
+        )
+
+    for key in ("errorType", "errorCode", "errorMessage", "errors", "error"):
+        value = funds_data.get(key)
+        if value:
+            return str(value)
+
+    return None
+
+
 def _try_resume_broker_session(username):
     """
     Check if the user has an existing valid broker session in the DB.
@@ -163,7 +190,20 @@ def _try_resume_broker_session(username):
         import importlib
         try:
             broker_module = importlib.import_module(f"broker.{broker}.api.funds")
+            if hasattr(broker_module, "test_auth_token"):
+                is_valid, error_message = broker_module.test_auth_token(auth_token)
+                if not is_valid:
+                    logger.info(
+                        f"Broker token expired or invalid for {username}: {error_message}"
+                    )
+                    return None
             funds_data = broker_module.get_margin_data(auth_token)
+            failure_reason = _broker_validation_failure_reason(funds_data)
+            if failure_reason:
+                logger.info(
+                    f"Broker token expired or invalid for {username}: {failure_reason}"
+                )
+                return None
             # get_margin_data returns {} on failure (doesn't raise) — treat empty as invalid
             if not funds_data:
                 logger.info(f"Broker token expired or invalid for {username} (empty funds response)")
@@ -231,13 +271,18 @@ def login():
         # Check if already logged in (check logged_in first — it means
         # broker auth is complete; "user" alone means only password was done)
         if session.get("logged_in"):
-            logger.info(f"[LOGIN] Already fully logged in, redirecting to /dashboard")
-            return jsonify(
-                {"status": "success", "message": "Already logged in", "redirect": "/dashboard"}
-            ), 200
+            if is_session_valid():
+                logger.info("[LOGIN] Already fully logged in, redirecting to /dashboard")
+                return jsonify(
+                    {"status": "success", "message": "Already logged in", "redirect": "/dashboard"}
+                ), 200
+
+            logger.info("[LOGIN] Existing session expired; clearing before password login")
+            revoke_user_tokens()
+            session.clear()
 
         if "user" in session:
-            logger.info(f"[LOGIN] User in session but not logged_in, redirecting to /broker")
+            logger.info("[LOGIN] User in session but not logged_in, redirecting to /broker")
             return jsonify(
                 {"status": "success", "message": "Already logged in", "redirect": "/broker"}
             ), 200
@@ -272,14 +317,14 @@ def login():
             resumed = _try_resume_broker_session(username)
             logger.info(f"[LOGIN] Resume result: {resumed is not None}, type={type(resumed).__name__ if resumed else 'None'}")
             if resumed:
-                logger.info(f"[LOGIN] Returning resume response to frontend")
+                logger.info("[LOGIN] Returning resume response to frontend")
                 from database.auth_db import log_login_attempt
                 log_login_attempt(username, ip, ua, status="success",
                                   login_type="resume", broker=session.get("broker"))
                 return resumed
 
             # No valid broker session — redirect to broker login
-            logger.info(f"[LOGIN] No valid broker session, redirecting to /broker")
+            logger.info("[LOGIN] No valid broker session, redirecting to /broker")
             from database.auth_db import log_login_attempt
             log_login_attempt(username, ip, ua, status="success", login_type="password")
             return jsonify({"status": "success"}), 200
@@ -295,11 +340,15 @@ def login():
     if find_user_by_username() is None:
         return redirect("/setup")
 
+    if session.get("logged_in"):
+        if is_session_valid():
+            return redirect("/dashboard")
+
+        revoke_user_tokens()
+        session.clear()
+
     if "user" in session:
         return redirect("/broker")
-
-    if session.get("logged_in"):
-        return redirect("/dashboard")
 
     return redirect("/login")
 
@@ -461,7 +510,18 @@ def two_factor_configure():
 @limiter.limit(LOGIN_RATE_LIMIT_HOUR)
 def broker_login():
     if session.get("logged_in"):
-        return redirect("/dashboard")
+        # Only bounce to the dashboard when the stored broker token is still
+        # valid. When it is revoked/expired (daily rollover, broker-side
+        # revocation), this page is the canonical re-auth entry point --
+        # unconditionally redirecting away left users stranded with no UI
+        # path to reconnect (issue #1400).
+        from database.auth_db import get_auth_token
+
+        if get_auth_token(session.get("user")):
+            return redirect("/dashboard")
+        logger.info(
+            f"Broker token invalid for {session.get('user')} - allowing re-authentication"
+        )
     if request.method == "GET":
         if "user" not in session:
             return redirect("/login")
@@ -858,6 +918,40 @@ def debug_smtp():
         ), 500
 
 
+# Throttle active-session heartbeat DB writes to at most one per device per
+# this many seconds. The SPA polls /session-status frequently; without a throttle
+# every poll would write to active_sessions.last_seen.
+HEARTBEAT_THROTTLE_SECONDS = 30
+
+
+def _touch_session_heartbeat():
+    """Refresh last_seen for this device's active session (throttled).
+
+    Wired into the SPA's /session-status poll so active_sessions.last_seen
+    tracks real liveness instead of staying frozen at login_time. See the
+    multi-session audit (finding #2). Throttled via the Flask session cookie
+    so a busy poll loop doesn't write to the DB on every request.
+    """
+    sid = session.get("session_id")
+    if not sid:
+        return
+    now = datetime.now(UTC)
+    last = session.get("last_heartbeat")
+    if last:
+        try:
+            if (now - datetime.fromisoformat(last)).total_seconds() < HEARTBEAT_THROTTLE_SECONDS:
+                return
+        except (ValueError, TypeError):
+            pass
+    try:
+        from database.auth_db import update_session_last_seen
+
+        update_session_last_seen(sid)
+        session["last_heartbeat"] = now.isoformat()
+    except Exception as e:
+        logger.warning(f"Error updating session heartbeat: {e}")
+
+
 @auth_bp.route("/session-status", methods=["GET"])
 def get_session_status():
     """Return current session status for React SPA."""
@@ -868,19 +962,39 @@ def get_session_status():
             {"status": "success", "message": "Not authenticated", "authenticated": False, "logged_in": False}
         ), 200
 
+    # Refresh this device's liveness heartbeat on every poll (throttled).
+    if session.get("logged_in"):
+        _touch_session_heartbeat()
+
     # If session claims to be logged in with broker, validate the auth token exists
     if session.get("logged_in") and session.get("broker"):
         from database.auth_db import get_api_key_for_tradingview, get_auth_token
 
         auth_token = get_auth_token(session.get("user"))
         if auth_token is None:
-            logger.warning(
-                f"Session status: stale session detected for user {session.get('user')} - no auth token"
+            # The BROKER token is gone (daily rollover / revocation) but the
+            # APP session is still valid. Do NOT clear or downgrade the
+            # session here: `logged_in` doubles as the app-session flag in
+            # utils/session.is_session_valid(), so popping it makes every
+            # @check_session_validity route (including /auth/dashboard-data)
+            # hard-logout the user before the reconnect UI can render
+            # (issue #1400). Keep the session intact and just flag the state;
+            # /auth/dashboard-data returns BROKER_SESSION_EXPIRED and the
+            # dashboard renders the Reconnect Broker action, while
+            # /auth/broker admits the user for re-authentication.
+            logger.info(
+                f"Session status: broker token invalid for user {session.get('user')} - "
+                "broker reconnect required"
             )
-            # Clear the stale session
-            session.clear()
             return jsonify(
-                {"status": "success", "message": "Session expired", "authenticated": False, "logged_in": False}
+                {
+                    "status": "success",
+                    "authenticated": True,
+                    "logged_in": True,
+                    "user": session.get("user"),
+                    "broker": session.get("broker"),
+                    "broker_session_expired": True,
+                }
             ), 200
 
         # Get API key for the user
@@ -1042,7 +1156,16 @@ def get_dashboard_data():
         return jsonify({"status": "error", "message": "Not authenticated"}), 401
 
     if not session.get("logged_in"):
-        return jsonify({"status": "error", "message": "Broker not connected"}), 401
+        # App session valid, broker not connected (fresh login or downgraded
+        # by session-status after a token rollover) -- the right CTA is the
+        # broker reconnect flow, not /login (issue #1400).
+        return jsonify(
+            {
+                "status": "error",
+                "code": "BROKER_SESSION_EXPIRED",
+                "message": "Broker not connected - please connect your broker",
+            }
+        ), 401
 
     login_username = session["user"]
     broker = session.get("broker")
@@ -1058,8 +1181,18 @@ def get_dashboard_data():
         AUTH_TOKEN = get_auth_token(login_username)
 
         if AUTH_TOKEN is None:
+            # The APP session is still valid -- it is the BROKER token that is
+            # revoked/expired. The machine-readable code lets the dashboard
+            # point the user at /broker (reconnect) instead of /login, which
+            # would just bounce them back (issue #1400).
             logger.warning(f"No auth token found for user {login_username}")
-            return jsonify({"status": "error", "message": "Session expired"}), 401
+            return jsonify(
+                {
+                    "status": "error",
+                    "code": "BROKER_SESSION_EXPIRED",
+                    "message": "Broker session expired - please reconnect your broker",
+                }
+            ), 401
 
         # Check if in analyze mode
         if get_analyze_mode():
