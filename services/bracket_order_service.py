@@ -254,9 +254,8 @@ def cancel_bracket_order(
 
                     if cur_status == "complete":
                         target_filled_during_cancel = True
-                        fill_price = float(st_resp.get("data", {}).get("price", bo.get("target_price", 0.0)))
-                        if fill_price <= 0:
-                            fill_price = float(st_resp.get("data", {}).get("average_price", bo.get("target_price", 0.0)))
+                        data_d = st_resp.get("data", {})
+                        fill_price = float(data_d.get("average_price") or data_d.get("price") or bo.get("target_price", 0.0))
                         break
                     elif cur_status in ["cancelled", "rejected"]:
                         target_cancel_confirmed = True
@@ -282,9 +281,8 @@ def cancel_bracket_order(
                     st_ok, st_resp, _ = get_order_status({"orderid": t_id, "strategy": bo["strategy"]}, api_key=api_key)
                     cur_status = st_resp.get("data", {}).get("order_status", "").lower() if st_ok else ""
                     if cur_status == "complete":
-                        fill_price = float(st_resp.get("data", {}).get("price", bo.get("target_price", 0.0)))
-                        if fill_price <= 0:
-                            fill_price = float(st_resp.get("data", {}).get("average_price", bo.get("target_price", 0.0)))
+                        data_d = st_resp.get("data", {})
+                        fill_price = float(data_d.get("average_price") or data_d.get("price") or bo.get("target_price", 0.0))
                         update_bracket_order(bo_id, {
                             "status": "COMPLETED",
                             "exit_type": "TARGET",
@@ -338,9 +336,8 @@ def cancel_bracket_order(
                     for _ in range(3):
                         st_ok, st_resp, _ = get_order_status({"orderid": sq_order_id}, api_key=api_key)
                         if st_ok and st_resp.get("data", {}).get("order_status", "").lower() == "complete":
-                            sq_fill_p = float(st_resp.get("data", {}).get("price", 0.0))
-                            if sq_fill_p <= 0:
-                                sq_fill_p = float(st_resp.get("data", {}).get("average_price", 0.0))
+                            sq_data = st_resp.get("data", {})
+                            sq_fill_p = float(sq_data.get("average_price") or sq_data.get("price") or 0.0)
                             break
                         time.sleep(0.3)
 

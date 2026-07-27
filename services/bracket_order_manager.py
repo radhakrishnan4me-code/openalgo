@@ -60,10 +60,23 @@ def _get_time_elapsed(dt_obj):
 
 
 def _get_fill_price(order_resp_data: dict, fallback_price: float = 0.0) -> float:
-    fill_price = float(order_resp_data.get("price", fallback_price))
-    if fill_price <= 0:
-        fill_price = float(order_resp_data.get("average_price", fallback_price))
-    return fill_price
+    """
+    Extract actual fill price from order status / tradebook response.
+    
+    CRITICAL FIX: Checks `average_price` FIRST because MARKET orders (or LIMIT orders
+    with price protection) carry a nominal order/buffer limit price in `price` (e.g. 582.85),
+    whereas the actual executed trade price is in `average_price` (e.g. 529.90).
+    Only falls back to `price` if `average_price` is missing or 0.
+    """
+    if not isinstance(order_resp_data, dict):
+        return float(fallback_price)
+    avg_price = float(order_resp_data.get("average_price") or 0.0)
+    if avg_price > 0:
+        return avg_price
+    nom_price = float(order_resp_data.get("price") or 0.0)
+    if nom_price > 0:
+        return nom_price
+    return float(fallback_price)
 
 
 def place_sl_market_exit_with_retries(bo: dict, exit_action: str, max_retries: int = SL_RETRY_ATTEMPTS) -> tuple[bool, dict]:

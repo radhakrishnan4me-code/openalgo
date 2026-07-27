@@ -157,6 +157,64 @@ def test_bo_single_resting_order_only(mock_update, mock_place, mock_quotes, mock
 
 
 @patch("services.bracket_order_manager.get_orders_by_status")
+@patch("services.bracket_order_manager.get_order_status")
+@patch("services.bracket_order_manager.get_quotes")
+@patch("services.bracket_order_manager.place_order")
+@patch("services.bracket_order_manager.update_bracket_order")
+def test_bo_market_entry_uses_average_price_for_target_sl_calc(mock_update, mock_place, mock_quotes, mock_order_status, mock_get_orders):
+    """
+    CRITICAL REGRESSION TEST:
+    Simulates production scenario where MARKET entry has nominal limit/buffer price 582.85,
+    but actual tradebook fill (average_price) is 529.90.
+    Verifies target_price (539.90) and sl_price (514.90) are calculated from average_price (529.90),
+    preventing false 'SL already crossed' triggers when LTP is 529.70.
+    """
+    from services.bracket_order_manager import _process_pending_entries
+
+    mock_bo = {
+        "bo_id": "bo_market_1",
+        "entry_order_id": "entry_m1",
+        "api_key": "key1",
+        "strategy": "strat1",
+        "symbol": "BANKNIFTY",
+        "exchange": "NFO",
+        "action": "BUY",
+        "quantity": 15,
+        "product": "MIS",
+        "price": 582.85,  # Nominal buffer price on order
+        "target_type": "points",
+        "target_value": 10.0,
+        "sl_type": "points",
+        "sl_value": 15.0,
+    }
+    mock_get_orders.return_value = [mock_bo]
+    # Broker order status returns nominal price 582.85 but executed average_price 529.90
+    mock_order_status.side_effect = [
+        (True, {"status": "success", "data": {"order_status": "complete", "price": 582.85, "average_price": 529.90}}, 200),
+        (True, {"status": "success", "data": {"order_status": "open"}}, 200),
+    ]
+    # Current LTP is 529.70 (0.20 points below average fill, but 14.8 points ABOVE sl_price of 514.90)
+    mock_quotes.return_value = (True, {"status": "success", "data": {"ltp": 529.70}}, 200)
+    mock_place.return_value = (True, {"status": "success", "orderid": "target_order_m1"}, 200)
+
+    _process_pending_entries()
+
+    # 1. Target order MUST be placed (not skipped due to false SL trigger!)
+    assert mock_place.call_count == 1
+    placed_payload = mock_place.call_args[0][0]
+    assert placed_payload["pricetype"] == "LIMIT"
+    # Target price MUST be 529.90 + 10.0 = 539.90 (NOT 582.85 + 10.0 = 592.85!)
+    assert float(placed_payload["price"]) == 539.9
+
+    # 2. Check bracket order status update details
+    update_calls = [call[0][1] for call in mock_update.call_args_list]
+    placing_update = next(u for u in update_calls if u.get("status") == "EXIT_PLACING")
+    assert placing_update["entry_price"] == 529.90
+    assert placing_update["target_price"] == 539.90
+    assert placing_update["sl_price"] == 514.90
+
+
+@patch("services.bracket_order_manager.get_orders_by_status")
 @patch("services.bracket_order_manager.get_quotes")
 @patch("services.bracket_order_manager.get_auth_token_broker")
 @patch("services.bracket_order_manager.cancel_order_with_auth")
