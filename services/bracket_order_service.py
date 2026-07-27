@@ -205,9 +205,14 @@ def cancel_bracket_order(
     bo_id: str, api_key: str, auth_token: str, broker: str, square_off: bool = False
 ) -> tuple[bool, dict[str, Any], int]:
     """
-    Cancel an active bracket order. 
+    Cancel an active or unprotected bracket order.
     Requires auth_token and broker resolved from the api_key.
     """
+    import time
+    from datetime import datetime, timezone
+    from events.order_events import BracketOrderCompletedEvent, BracketOrderAlertEvent
+    from services.orderstatus_service import get_order_status
+
     bo = get_bracket_order_by_bo_id(bo_id, api_key)
     if not bo:
         return False, {"status": "error", "message": "Bracket order not found or invalid API key"}, 404
@@ -220,30 +225,96 @@ def cancel_bracket_order(
     try:
         messages = []
         if status == "ENTRY_PENDING" and bo["entry_order_id"]:
-            # Cancel entry
+            # Cancel entry order
             status_data = {"orderid": bo["entry_order_id"], "strategy": bo["strategy"]}
-            ok, resp, _ = cancel_order_with_auth(status_data, auth_token, broker, status_data)
+            ok, resp, _ = cancel_order_with_auth(bo["entry_order_id"], auth_token, broker, status_data)
             if ok:
                 messages.append("Entry order cancelled")
-            
-        elif status == "ACTIVE":
-            # Cancel target
-            if bo["target_order_id"]:
-                status_data = {"orderid": bo["target_order_id"], "strategy": bo["strategy"]}
-                ok, resp, _ = cancel_order_with_auth(status_data, auth_token, broker, status_data)
-                if ok:
-                    messages.append("Target order cancelled")
-            
-            # Cancel SL
-            if bo["sl_order_id"]:
-                status_data = {"orderid": bo["sl_order_id"], "strategy": bo["strategy"]}
-                ok, resp, _ = cancel_order_with_auth(status_data, auth_token, broker, status_data)
-                if ok:
-                    messages.append("SL order cancelled")
-            
-            # Square off via market order if requested
+            update_bracket_order(bo_id, {"status": "CANCELLED"})
+            bus.publish(BracketOrderCancelledEvent(bo_id=bo_id))
+            return True, {"status": "success", "message": "Entry order cancelled", "details": messages}, 200
+
+        elif status in ["ACTIVE", "CRITICAL_UNPROTECTED"]:
+            target_cancel_confirmed = True
+            target_filled_during_cancel = False
+            fill_price = 0.0
+
+            t_id = bo.get("target_order_id")
+            if t_id:
+                status_data = {"orderid": t_id, "strategy": bo["strategy"]}
+                ok, resp, _ = cancel_order_with_auth(t_id, auth_token, broker, status_data)
+                
+                # STRICT VERIFICATION POLL (Same discipline as BO Manager)
+                target_cancel_confirmed = False
+                for _ in range(5):
+                    time.sleep(0.2)
+                    st_ok, st_resp, _ = get_order_status({"orderid": t_id, "strategy": bo["strategy"]}, api_key=api_key)
+                    cur_status = st_resp.get("data", {}).get("order_status", "").lower() if st_ok else ""
+
+                    if cur_status == "complete":
+                        target_filled_during_cancel = True
+                        fill_price = float(st_resp.get("data", {}).get("price", bo.get("target_price", 0.0)))
+                        if fill_price <= 0:
+                            fill_price = float(st_resp.get("data", {}).get("average_price", bo.get("target_price", 0.0)))
+                        break
+                    elif cur_status in ["cancelled", "rejected"]:
+                        target_cancel_confirmed = True
+                        break
+
+                if target_filled_during_cancel:
+                    update_bracket_order(bo_id, {
+                        "status": "COMPLETED",
+                        "exit_type": "TARGET",
+                        "exit_price": fill_price,
+                        "completed_at": datetime.now(timezone.utc)
+                    })
+                    bus.publish(BracketOrderCompletedEvent(bo_id=bo_id, exit_type="TARGET", exit_price=fill_price))
+                    logger.info(f"Manual cancel_bracket_order for BO {bo_id}: Target order filled at {fill_price} during cancellation attempt.")
+                    return True, {
+                        "status": "success",
+                        "message": "Target order filled during cancellation attempt",
+                        "data": {"exit_type": "TARGET", "exit_price": fill_price}
+                    }, 200
+
+                if not target_cancel_confirmed:
+                    time.sleep(0.5)
+                    st_ok, st_resp, _ = get_order_status({"orderid": t_id, "strategy": bo["strategy"]}, api_key=api_key)
+                    cur_status = st_resp.get("data", {}).get("order_status", "").lower() if st_ok else ""
+                    if cur_status == "complete":
+                        fill_price = float(st_resp.get("data", {}).get("price", bo.get("target_price", 0.0)))
+                        if fill_price <= 0:
+                            fill_price = float(st_resp.get("data", {}).get("average_price", bo.get("target_price", 0.0)))
+                        update_bracket_order(bo_id, {
+                            "status": "COMPLETED",
+                            "exit_type": "TARGET",
+                            "exit_price": fill_price,
+                            "completed_at": datetime.now(timezone.utc)
+                        })
+                        bus.publish(BracketOrderCompletedEvent(bo_id=bo_id, exit_type="TARGET", exit_price=fill_price))
+                        return True, {
+                            "status": "success",
+                            "message": "Target order filled during cancellation attempt",
+                            "data": {"exit_type": "TARGET", "exit_price": fill_price}
+                        }, 200
+                    elif cur_status in ["cancelled", "rejected"]:
+                        target_cancel_confirmed = True
+
+            # If square_off requested, strictly require confirmed target cancellation
             if square_off:
-                close_action = "SELL" if bo["action"] == "BUY" else "BUY"
+                if not target_cancel_confirmed:
+                    logger.critical(f"Manual cancel_bracket_order for BO {bo_id}: Target cancellation unconfirmed. ABORTING market square-off!")
+                    update_bracket_order(bo_id, {
+                        "status": "CRITICAL_UNPROTECTED",
+                        "error_message": "Manual cancel: Target cancellation unconfirmed"
+                    })
+                    bus.publish(BracketOrderAlertEvent(bo_id=bo_id, error_message="Manual cancel: Target cancellation unconfirmed"))
+                    return False, {
+                        "status": "error",
+                        "message": "Target cancellation unconfirmed; market square-off aborted to prevent double-position"
+                    }, 500
+
+                # Target cancellation IS confirmed -> Execute market square-off
+                close_action = "SELL" if bo["action"].upper() == "BUY" else "BUY"
                 sq_payload = {
                     "apikey": api_key,
                     "strategy": bo["strategy"],
@@ -256,20 +327,58 @@ def cancel_bracket_order(
                 }
                 from services.place_order_service import place_order
                 sq_ok, sq_resp, _ = place_order(sq_payload, api_key=api_key)
-                if sq_ok:
-                    messages.append("Position squared off")
-                else:
-                    messages.append("Failed to square off position")
 
-        update_bracket_order(bo_id, {"status": "CANCELLED"})
-        bus.publish(BracketOrderCancelledEvent(bo_id=bo_id))
-        
-        return True, {
-            "status": "success",
-            "message": "Bracket order cancelled",
-            "details": messages
-        }, 200
+                if sq_ok and sq_resp.get("status") == "success":
+                    sq_order_id = sq_resp.get("orderid")
+                    messages.append("Position squared off via MARKET order")
+                    
+                    # Verify fill
+                    sq_fill_p = 0.0
+                    for _ in range(3):
+                        st_ok, st_resp, _ = get_order_status({"orderid": sq_order_id}, api_key=api_key)
+                        if st_ok and st_resp.get("data", {}).get("order_status", "").lower() == "complete":
+                            sq_fill_p = float(st_resp.get("data", {}).get("price", 0.0))
+                            if sq_fill_p <= 0:
+                                sq_fill_p = float(st_resp.get("data", {}).get("average_price", 0.0))
+                            break
+                        time.sleep(0.3)
+
+                    update_bracket_order(bo_id, {
+                        "status": "COMPLETED",
+                        "exit_type": "MANUAL_SQUAREOFF",
+                        "exit_price": sq_fill_p,
+                        "completed_at": datetime.now(timezone.utc)
+                    })
+                    bus.publish(BracketOrderCompletedEvent(bo_id=bo_id, exit_type="MANUAL_SQUAREOFF", exit_price=sq_fill_p))
+                    return True, {
+                        "status": "success",
+                        "message": "Bracket order cancelled and position squared off",
+                        "details": messages
+                    }, 200
+                else:
+                    logger.critical(f"Manual cancel_bracket_order for BO {bo_id}: Market square-off placement failed!")
+                    update_bracket_order(bo_id, {
+                        "status": "CRITICAL_UNPROTECTED",
+                        "error_message": "Manual cancel: Market square-off placement failed"
+                    })
+                    bus.publish(BracketOrderAlertEvent(bo_id=bo_id, error_message="Manual cancel: Market square-off placement failed"))
+                    return False, {
+                        "status": "error",
+                        "message": "Target cancelled but market square-off placement failed"
+                    }, 500
+
+            else:
+                update_bracket_order(bo_id, {"status": "CANCELLED"})
+                bus.publish(BracketOrderCancelledEvent(bo_id=bo_id))
+                return True, {
+                    "status": "success",
+                    "message": "Bracket order cancelled",
+                    "details": messages
+                }, 200
+
+        return False, {"status": "error", "message": f"Unsupported state for cancellation: {status}"}, 400
 
     except Exception as e:
         logger.error(f"Error cancelling BO {bo_id}: {e}")
         return False, {"status": "error", "message": f"Error during cancellation: {str(e)}"}, 500
+
