@@ -206,7 +206,7 @@ def get_active_bo_for_symbol(api_key: str, symbol: str, exchange: str, action: s
     """Check if there's already an active bracket order for this exact setup to prevent duplicates."""
     session = db_session()
     try:
-        active_statuses = ["CREATED", "ENTRY_PENDING", "ENTRY_FILLED", "EXIT_PLACING", "ACTIVE"]
+        active_statuses = ["CREATED", "ENTRY_PENDING", "ENTRY_FILLED", "EXIT_PLACING", "ACTIVE", "CRITICAL_UNPROTECTED"]
         bo = session.query(BracketOrder).filter(
             BracketOrder.api_key == api_key,
             BracketOrder.symbol == symbol,
