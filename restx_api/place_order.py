@@ -6,7 +6,6 @@ from marshmallow import ValidationError
 
 from limiter import limiter
 from restx_api.schemas import OrderSchema
-from services.place_order_service import place_order
 from utils.logging import get_logger
 
 ORDER_RATE_LIMIT = os.getenv("ORDER_RATE_LIMIT", "10 per second")
@@ -38,6 +37,7 @@ class PlaceOrder(Resource):
             api_key = order_data.get("apikey", None)
 
             # Call the service function to place the order
+            from services.place_order_service import place_order
             success, response_data, status_code = place_order(order_data=order_data, api_key=api_key)
 
             return make_response(jsonify(response_data), status_code)

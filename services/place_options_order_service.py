@@ -18,7 +18,6 @@ from database.auth_db import get_auth_token_broker
 from database.settings_db import get_analyze_mode
 from events import AnalyzerErrorEvent, OptionsOrderCompletedEvent
 from services.option_symbol_service import get_option_symbol
-from services.place_order_service import place_order
 from utils.event_bus import bus
 from utils.logging import get_logger
 
@@ -63,6 +62,7 @@ def place_single_split_order(
         Result dictionary with order status
     """
     try:
+        from services.place_order_service import place_order
         # Pass emit_event=False to suppress per-order socket events
         # A summary event is emitted at the end of all split orders
         success, order_response, status_code = place_order(
@@ -357,6 +357,7 @@ def place_options_order(
 
         # Step 3: Place the order using the standard place_order service
         # This automatically handles live vs analyze mode
+        from services.place_order_service import place_order
         success, order_response, status_code = place_order(
             order_data=order_data, api_key=api_key, auth_token=auth_token, broker=broker
         )

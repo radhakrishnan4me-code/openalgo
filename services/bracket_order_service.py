@@ -12,6 +12,7 @@ from events.order_events import (
     BracketOrderPlacedEvent,
 )
 from services.cancel_order_service import cancel_order_with_auth
+from services.orderstatus_service import get_order_status
 from utils.event_bus import EventBus
 from utils.logging import get_logger
 
@@ -325,8 +326,8 @@ def cancel_bracket_order(
                     "pricetype": "MARKET",
                     "product": bo["product"]
                 }
-                from services.place_order_service import place_order
-                sq_ok, sq_resp, _ = place_order(sq_payload, api_key=api_key)
+                import services.place_order_service
+                sq_ok, sq_resp, _ = services.place_order_service.place_order(sq_payload, api_key=api_key)
 
                 if sq_ok and sq_resp.get("status") == "success":
                     sq_order_id = sq_resp.get("orderid")
