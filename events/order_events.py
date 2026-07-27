@@ -240,3 +240,12 @@ class BracketOrderCancelledEvent(OrderEvent):
     topic: str = "bracket_order.cancelled"
     bo_id: str = ""
 
+
+@dataclass
+class BracketOrderAlertEvent(OrderEvent):
+    """Fired when a bracket order enters CRITICAL_UNPROTECTED state or encounters an urgent alert condition."""
+    topic: str = "bracket_order.alert"
+    bo_id: str = ""
+    error_message: str = ""
+
+
