@@ -1376,6 +1376,21 @@ def stream_run(
     )
 
     def _start() -> Iterator[Any]:
+        if chatgpt_oauth.is_subscription_model(
+            model or getattr(getattr(agent, "model", None), "id", "")
+        ):
+            from services.agent.async_stream import iter_async_stream
+
+            return iter_async_stream(
+                lambda: agent.arun(
+                    message,
+                    stream=True,
+                    stream_events=True,
+                    session_id=session_id,
+                    user_id=user_id,
+                    **run_kwargs,
+                )
+            )
         return agent.run(
             message,
             stream=True,
@@ -1450,6 +1465,22 @@ def stream_continue(
                 user_id=user_id,
                 decisions=decisions or {},
                 note=note,
+            )
+        if chatgpt_oauth.is_subscription_model(
+            model or getattr(getattr(agent, "model", None), "id", "")
+        ):
+            from services.agent.async_stream import iter_async_stream
+
+            return iter_async_stream(
+                lambda: agent.acontinue_run(
+                    run_id=run_id,
+                    session_id=session_id,
+                    user_id=user_id,
+                    requirements=resolved,
+                    stream=True,
+                    stream_events=True,
+                    **continue_kwargs,
+                )
             )
         return agent.continue_run(
             run_id=run_id,
