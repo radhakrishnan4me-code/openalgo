@@ -251,14 +251,15 @@ def _require_agno() -> tuple[type, type, type]:
     """
     try:
         from agno.agent import Agent
-        from agno.db.sqlite import SqliteDb
         from agno.models.litellm import LiteLLM
+
+        from services.agent.session_store import SessionFirstSqliteDb
     except ImportError as exc:
         raise AgnoNotInstalled(
             "The agent module requires the 'agno' package, which is not installed. "
             "Install it with: uv add agno"
         ) from exc
-    return Agent, LiteLLM, SqliteDb
+    return Agent, LiteLLM, SessionFirstSqliteDb
 
 
 # ---------------------------------------------------------------------------

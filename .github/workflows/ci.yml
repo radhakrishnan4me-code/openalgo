@@ -66,6 +66,23 @@ jobs:
             test/test_option_symbol_service_validation.py \
             -v --timeout=60
 
+  # Exercise the production thread boundary as well as ordinary asyncio.
+  agent-regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+      - run: uv sync
+      - name: Agent streaming and session regressions
+        run: >-
+          uv run --with eventlet pytest
+          test/test_agent_async_stream.py
+          test/test_agent_session_store.py
+          test/test_agent_stream_eventlet.py
+          -v --timeout=180
+
   # Frontend linting
   frontend-lint:
     runs-on: ubuntu-latest
@@ -385,3 +402,4 @@ jobs:
           exit-code: '0'
           severity: 'CRITICAL,HIGH'
           format: 'table'
+
